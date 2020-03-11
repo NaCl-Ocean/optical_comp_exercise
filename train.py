@@ -3,25 +3,18 @@ import unet_model
 import dataset
 import torch.nn as nn
 from skimage import measure
+import datetime
 import csv
 
 # 每一类对于loss的weight
-loss_weight = np.array([0.25,0.25,0.25,0.25])
+loss_weight = np.array([0.2, 0.2, 0.2, 0.2, 0.2])
 
-class_dict ={'holothurian': 1, 'echinus': 2, 'scallop': 3, 'starfish': 4}
-class_dict_reverse = {1:'holothurian', 2:'echinus', 3:'scallop', 4:'starfish'}
 
-# parameters
-args = {'train_ratio': 0.8, 'shuffle': False, 'augment': True,
-        'momentum_factor': 0.9, 'learning_rate': 1e-4, 'weight_decay':1e-4, 'grad_clip_by_value':1.0,
-        'batch_size': 3, 'epochs': 60,
-        'in_channels': 3, 'n_classes': 5,
-        'save':True, 'save_freq':20,
-        'confidence_threshold': 0.5}
+
 
 class Trainer():
-    def __init__(self, dir_dict):
-        self.batch_size = int(args['batch_size'])
+    def __init__(self, dir_dict, args):
+        self.args=args
         self.augment = args['augment']
         self.train_ratio = float(args['train_ratio'])
         self.shuffle = args['shuffle']
@@ -34,30 +27,39 @@ class Trainer():
         self.grid_clip_by_value = float(args['grad_clip_by_value'])
         self.save = args['save']
         self.save_freq = int(args['save_freq'])
-        self.save_dir = dir_dict['save_dir']
-        self.confidence_threshold = float(dir_dict['confidence_threshold'])
-        self.csv_dir = dir_dict['csv_dir']
+        self.confidence_threshold = float(args['confidence_threshold'])
+        self.lr_decay_step = int(args['lr_decay_step'])
+        self.dir_dict = dir_dict
+        # to GPU
+        self.cuda_gpu = torch.cuda.is_available()
+        # load dataset
         self.bulid_dataset()
-        self.build_model()
+        # build model
+        if self.cuda_gpu:
+            self.model = unet_model.UNet(self.n_channels, self.n_classes).cuda()
+        else:
+            self.model = unet_model.UNet(self.n_channels, self.n_classes)
+        # build optimizer
+        self.build_optimiezer()
 
-    def build_model(self):
-        self.model = unet_model.UNet(self.n_channels, self.n_classes)
+
+
 
     def bulid_dataset(self):
-        self.train_dataloader = dataset.get_train_dataloaders(batch_size= self.batch_size, augment=self.augment, shuffle=self.shuffle, train_size=self.train_ratio)
-        self.val_dataloader = dataset.get_Val_dataloaders(batch_size= self.batch_size, shuffle=self.shuffle, train_size=self.train_ratio)
+        self.train_dataloader = dataset.get_train_dataloaders(self.dir_dict['train_image_dir'],self.dir_dict['train_box_dir'],batch_size= int(self.args['batch_size']), augment=self.augment, shuffle=self.shuffle, train_size=self.train_ratio)
+        self.val_dataloader = dataset.get_Val_dataloaders(self.dir_dict['train_image_dir'],self.dir_dict['train_box_dir'],batch_size= int(self.args['batch_size']), shuffle=self.shuffle, train_size=self.train_ratio)
 
     def loss(self, output, label):
-        loss_function = nn.CrossEntropyLoss(weight=torch.tensor(loss_weight))
+        if self.cuda_gpu:
+            loss_function = nn.CrossEntropyLoss(weight=torch.tensor(loss_weight).float().cuda())
+        else:
+            loss_function = nn.CrossEntropyLoss(weight=torch.tensor(loss_weight).float())
 
         # output:(B,n,H,W) to (B,H,W,n)
         # label:(B,H,W) [0,3]
         # label 对应 output的通道 0->通道0 1->通道1 2->通道2 3->通道3
         # output 的通道0表示label=0的概率分布
-        for i, j in [[1,2],[2,3]]:
-            # 转置操作 类似于numpy.moveaxis
-            output = torch.transpose(output, i, j)
-        loss = loss_function(output.contiguous(), label)
+        loss = loss_function(output, label)
         return loss
 
 
@@ -66,30 +68,71 @@ class Trainer():
         parameters = model.parameters()
         self.optimizer = torch.optim.SGD(parameters, lr=self.learning_rate, momentum=self.momentum_factor, weight_decay=self.weight_decay)
 
-    def train_epoch(self):
+    def train(self):
+        self.model = self.model
+        self.model.train()
+        Map_result_file = self.dir_dict['result_dir'] + '/'+datetime.datetime.now().strftime('%Y_%m_%d_%H_%M_%S') + '.csv'
+        with open(Map_result_file,'w') as Map_result_file:
+            Map_writer = csv.writer(Map_result_file)
+            # Map_header = ['epoch','train_Map','train_loss','val_Map','val_loss']
+            Map_header = ['epoch','train_loss','val_loss']
+            Map_writer.writerow(Map_header)
+
+            for i in range(1, self.epochs + 1):\
+
+                print('train epoch',i)
+                train_csv_path, train_loss = self.train_epoch(i)
+                print('epoch'+str(i)+'train'+str(train_loss))
+
+                self.save_checkpoints(epoch=i)
+                #train_Map = Map_metric.Map_eval(self.dir_dict['train_box_dir'],train_csv_path,self.n_classes)
+                print('validate epoch',i)
+                val_csv_path, val_loss=self.validate_epoch(i)
+                print('epoch' + str(i) + 'validata' + str(val_loss))
+                #val_Map = Map_metric.Map_eval(self.dir_dict['train_box_dir'],val_csv_path,self.n_classes)
+                # write the train map and validate map to csv file
+                Map_writer.writerow([i,train_loss,val_loss])
+
+
+    def train_epoch(self,epoch):
         model, train_loader, optimizer = self.model, self.train_dataloader, self.optimizer
         model.train()
-        steps = 0
-        for i, (image,label) in  enumerate(train_loader):
-            image = image
-            label = label
-            output = model(image)
-            loss = self.loss(output= output, label= label)
-            optimizer.zero_grad()
-            loss.backward()
+        losses = AverageMeter()
+        self.adjust_learning_rate(epoch)
+        csv_file_path = self.dir_dict['csv_dir'] + '/'+datetime.datetime.now().strftime('%Y_%m_%d_%H_%M_%S') + '_train_' + str("%06d" % epoch ) + '.csv'
+        with open(csv_file_path,'w',newline='') as csvfile:
+            csv_writer = csv.writer(csvfile)
+            csv_head = ['name','image_id','confidence','xmin','ymin','xmax','ymax']
+            csv_writer.writerow(csv_head)
 
-            for p in model.parameters():
-                if p.grad is not None:
-                    p.grad.data.clamp_(-self.grid_clip_by_value, self.grid_clip_by_value)
+            for i, (image,label,image_ids) in  enumerate(train_loader):
+            # batch
+                if self.cuda_gpu:
+                    image = image.cuda()
+                    label = label.cuda()
+                    output = model(image)
+                else:
+                    image = image
+                    label = label
+                    output = model(image)
+                loss = self.loss(output=output, label= label)
+                output = output.cpu()
+                losses.update(float(loss.data.item()), image.size(0))
+                optimizer.zero_grad()
+                loss.backward()
 
-            optimizer.step()
-            for b in range(self.batch_size):
-                steps = steps + 1
-                output_b = output[b,:,:,:]
-                for j in range(1,self.n_classes+1):
-                    class_j_image = output_b[j,:,:]
+                for p in model.parameters():
+                    if p.grad is not None:
+                        p.grad.data.clamp_(-self.grid_clip_by_value, self.grid_clip_by_value)
 
+                optimizer.step()
+                if i % 100 == 0:
+                    print('finish training image',image_ids)
+                self.write_det_csv(image_ids, csv_writer=csv_writer, output=output)
 
+            # close the csv file to read the csv file
+            csvfile.close()
+        return csv_file_path, losses.avg
 
 
 
@@ -97,43 +140,112 @@ class Trainer():
     def save_checkpoints(self, epoch):
         model = self.model
         if self.save and epoch % self.save_freq == 0 :
-            torch.save(self.model.state_dict(), self.save_dir, '/epoch%s.pth' % str(epoch).zfill(3))
+            torch.save(self.model.state_dict(), self.dir_dict['save_dir'] + datetime.datetime.now().strftime('%Y_%m_%d_%H_%M_%S') + str("%06d" % epoch) +'.pth')
         elif epoch == self.epochs:
-            torch.save(model.state_dict(), self.save_dir + '/epoch%s.pth' % str(epoch).zfill(3))
-
-    def train(self):
-        self.model = self.model
-
-
-        self.model.trian()
-        for i in range(1, self.epochs+1):
-            self.train_epoch()
-            self.save_checkpoints(epoch = i)
+            torch.save(model.state_dict(), self.dir_dict['save_dir'] + datetime.datetime.now().strftime('%Y_%m_%d_%H_%M_%S') + str("%06d" % epoch) +'.pth')
 
 
 
 
-    def get_bbox(self, class_i_image,class_i,steps):
-        bboxs = []
+    def get_confidence(self,class_i_image,bbox):
+        confidences = []
+        mask = class_i_image[bbox[0]:bbox[2],bbox[1]:bbox[3]]
+        # 取像素中置信度最高为最终的置信度
+        confidence = np.max(np.max(mask))
+        return confidence
 
-        class_i_image = np.numpy(class_i_image)
-        class_i_image = np.where(class_i_image >= self.confidence_threshold, 1, 0)
-        lbl = measure.label(class_i_image)
+    def validate_epoch(self, epoch):
+        val_loader, model = self.val_dataloader, self.model
+        model.eval()
+        losses = AverageMeter()
+        # detection result
+        csv_file_path = self.dir_dict['csv_dir'] +'/'+ datetime.datetime.now().strftime('%Y_%m_%d_%H_%M_%S') + \
+                        '_val_' + str("%06d" % epoch) + '.csv'
+        with open(csv_file_path,'w') as CSVfile:
+            csv_writer = csv.writer(CSVfile)
+            csv_head = ['name', 'image_id', 'confidence', 'xmin', 'ymin', 'xmax', 'ymax']
+            csv_writer.writerow(csv_head)
+            for i,(image,label,image_ids) in  enumerate(val_loader):
+                if self.cuda_gpu:
+                    image = image.cuda()
+                    label = label.cuda()
+                    output = model(image)
+                else:
+                    image = image
+                    label = label
+                    output = model(image)
+                loss = self.loss(output,label)
+                output = output.cpu()
+                losses.update(float(loss.data.item()),image.size(0))
+                if i % 100 == 0:
+                    print('finish validating image',image_ids)
+                self.write_det_csv(image_ids, csv_writer=csv_writer, output= output)
+            CSVfile.close()
+
+        return csv_file_path, losses.avg
+
+
+
+
+
+
+    def write_det_csv(self,image_ids,csv_writer,output):
+        for b in range(list(image_ids.size())[0]):
+            # 处理单个batch中sample data
+            image_id = image_ids[b].numpy()
+            output_b = output[b, :, :, :]
+            for j in range(1, self.n_classes):
+                # 处理sample data中的单个通道（class)
+                class_j_image = output_b[j, :, :]
+                csv_content = self.get_bbox(class_j_image, j, image_id,csv_writer=csv_writer)
+
+
+    def get_bbox(self, class_i_image, class_i, image_id,csv_writer):
+
+        csv_content = []
+
+        class_i_image_numpy = class_i_image.detach().numpy()
+        binary_image = np.where(class_i_image_numpy >= self.confidence_threshold, 1, 0)
+        # 连通域分析
+        # mask to bbox
+        # 效果不太好
+        lbl = measure.label(binary_image)
         props = measure.regionprops(lbl)
         # bbox x_min,y_min,x_max,y_max
         for prop in props:
-            bboxs.append([class_dict_reverse[class_i], str("%06d" % steps)])
-        return bboxs
-
-    def write_csv(self, image_id, class_i, csv_file_path):
-        csv_file_path = self.csv_dir + ''
+            bbox = prop.bbox
+            confidence = self.get_confidence(class_i_image_numpy, bbox)
+            csv_writer.writerow([class_dict_reverse[class_i], str("%06d" % (image_id+1))+'.xml', confidence, bbox[0], bbox[1], bbox[2], bbox[3]])
 
 
 
+    def adjust_learning_rate(self, epoch):
+        """Sets the learning rate to the initial LR decayed by 10 after args.lr_decay_step steps"""
+        lr = self.learning_rate * (0.1 ** (epoch // self.lr_decay_step))
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = lr
 
 
-    def map_metric(self):
+class AverageMeter(object):
+    """Computes and stores the average and current value"""
+    def __init__(self):
+        self.reset()
 
-    def validate_epoch(self):
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
+
+
+
+
+
 
 
